@@ -209,7 +209,7 @@ async def auth_callback(code: str, db: Session = Depends(get_db)):
     response      = RedirectResponse(url=FRONTEND_URL)
     response.set_cookie(
         key="session", value=session_token,
-        httponly=True, samesite="lax", secure=False,
+        httponly=True, samesite="none", secure=True,
         max_age=60 * 60 * 24 * 30,
     )
     return response
