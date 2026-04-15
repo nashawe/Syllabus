@@ -1,7 +1,8 @@
 import { useState, useEffect } from "react";
 import Nav from "./Nav";
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const API =
+  import.meta.env.VITE_API_URL || "https://syllabus-production.up.railway.app";
 
 const DUMMY_USER = {
   name: "Nate Shawe",

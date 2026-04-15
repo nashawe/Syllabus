@@ -3,7 +3,8 @@ import LandingPage from "./LandingPage";
 import UploadPage from "./UploadPage";
 import Dashboard from "./Dashboard";
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const API =
+  import.meta.env.VITE_API_URL || "https://syllabus-production.up.railway.app";
 
 function App() {
   const [page, setPage] = useState(null);

@@ -1,4 +1,5 @@
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const API =
+  import.meta.env.VITE_API_URL || "https://syllabus-production.up.railway.app";
 
 export default function Nav({ user, onNavigate, page }) {
   const handleLogout = async () => {
