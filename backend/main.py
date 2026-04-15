@@ -14,8 +14,8 @@ from openai import OpenAI
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
-from backend.database import get_db, create_tables, User, Course
-from backend.auth import create_session_token, get_current_user_id
+from database import get_db, create_tables, User, Course
+from auth import create_session_token, get_current_user_id
 
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
