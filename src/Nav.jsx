@@ -28,11 +28,11 @@ export default function Nav({ user, onNavigate, page }) {
       >
         <div className="w-8 h-8 rounded-lg bg-ink-900 flex items-center justify-center">
           <span className="text-ivory-50 font-serif font-bold text-sm leading-none">
-            S
+            D
           </span>
         </div>
         <span className="text-ink-900 font-semibold text-lg tracking-tight">
-          Syllabus
+          Deadlined
         </span>
       </button>
 
@@ -40,7 +40,6 @@ export default function Nav({ user, onNavigate, page }) {
       <div className="flex items-center gap-6">
         {user ? (
           <>
-            {/* Nav links */}
             <button
               onClick={() => onNavigate("dashboard")}
               className={`text-sm font-medium transition-colors duration-150 ${
@@ -72,7 +71,6 @@ export default function Nav({ user, onNavigate, page }) {
                 </div>
               </button>
 
-              {/* Dropdown */}
               <div className="absolute right-0 top-full mt-2 w-48 rounded-xl border border-ivory-300 bg-white shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-150 z-50">
                 <div className="px-4 py-3 border-b border-ivory-200">
                   <p className="text-ink-800 text-sm font-medium leading-none">

@@ -7,10 +7,12 @@ import httpx
 import os
 import json
 import re
+import uuid
 import pdfplumber
 import io
 from dotenv import load_dotenv
 from openai import OpenAI
+from collections import defaultdict
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -41,7 +43,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 def _build_prompt(text: str) -> str:
-    return f"""You are an expert academic calendar parser. Your job is to extract EVERY SINGLE schedulable event from this university syllabus — be exhaustive and aggressive. Do not skip anything.
+    return f"""You are an expert academic calendar parser. Extract EVERY schedulable event AND all key course metadata from this university syllabus — be exhaustive and aggressive.
 
 Return ONLY a valid JSON object with this exact structure, no preamble, no markdown, no explanation:
 {{
@@ -49,6 +51,16 @@ Return ONLY a valid JSON object with this exact structure, no preamble, no markd
   "course_code": "e.g. COMP SCI 300",
   "semester_start": "YYYY-MM-DD",
   "semester_end": "YYYY-MM-DD",
+  "professor": "Professor name or null",
+  "professor_email": "email@university.edu or null",
+  "office_hours": "e.g. Mon/Wed 2-4pm, Room 123 or null",
+  "location": "e.g. Science Hall 180 or null",
+  "description": "1-2 sentence course description or null",
+  "grading_breakdown": [
+    {{"component": "Exams", "weight": "40%"}},
+    {{"component": "Homework", "weight": "30%"}}
+  ],
+  "required_texts": ["Author Last, First. Title. Publisher, Year."],
   "events": [
     {{
       "title": "Event title",
@@ -72,12 +84,11 @@ Return ONLY a valid JSON object with this exact structure, no preamble, no markd
 CRITICAL RULES — follow every single one:
 
 1. RECURRING EVENTS: If the syllabus mentions something happens weekly or on a repeating schedule, generate a SEPARATE event entry for EVERY SINGLE occurrence. For example:
-   - "Discussion responses due every Wednesday 11:59pm from Jan 28 through Apr 8" → generate one event per Wednesday (Jan 28, Feb 4, Feb 11, Feb 18, Feb 25, Mar 4, Mar 11, Mar 18, Mar 25, Apr 1, Apr 8)
+   - "Discussion responses due every Wednesday 11:59pm from Jan 28 through Apr 8" → generate one event per Wednesday
    - "Lecture meets Tuesdays and Thursdays 1:20-2:10" → generate one event per lecture day for the entire semester
-   - "Homework due weekly on Fridays" → generate one event per Friday
    Never write a single "recurring" event. Always expand into individual dates.
 
-2. LECTURES: Extract every single class meeting. If the syllabus says "Tuesdays and Thursdays 1:20-2:10pm" generate a lecture event for every Tuesday and Thursday of the semester. Title each one with the topic if given (e.g. "Lecture: Intro to Recursion"), otherwise title it "Lecture".
+2. LECTURES: Extract every single class meeting. If the syllabus says "Tuesdays and Thursdays 1:20-2:10pm" generate a lecture event for every Tuesday and Thursday of the semester.
 
 3. PAPERS AND ASSIGNMENTS: Every paper, assignment, project, lab report, or written submission is a separate homework or project event.
 
@@ -93,28 +104,25 @@ CRITICAL RULES — follow every single one:
 
 7. TYPE RULES:
    - exam: midterms, finals, quizzes, tests
-   - homework: papers, written responses, discussion posts, lab reports, problem sets, lecture notes submissions
+   - homework: papers, written responses, discussion posts, lab reports, problem sets
    - project: multi-week projects, group projects, presentations
    - lecture: class meetings, lectures, discussion sections
 
 8. DATE FORMAT: Always YYYY-MM-DD. Infer the year from context (this is Spring 2026 if not stated).
 
-9. CONFIDENCE: Mark "low" only when you are genuinely unsure about a date. Mark "high" for anything explicitly stated.
+9. CONFIDENCE: Mark "low" only when you are genuinely unsure about a date.
 
-10. OMISSIONS: List things commonly found in syllabi that you could NOT find (e.g. if there are no listed exams, note that).
+10. OMISSIONS: List things commonly found in syllabi that you could NOT find.
 
-Be thorough. A good parse of a 14-week course should produce 50-100+ events when lectures and weekly assignments are included.
+11. METADATA: Extract professor name, email, office hours, and location from the contact/instructor section. For grading_breakdown, extract every graded component with its percentage weight. For required_texts, list each required book/text. Use null for any field not found.
+
+Be thorough. A good parse of a 14-week course should produce 50-100+ events.
 
 Syllabus text:
 {text[:12000]}"""
 
 
 def parse_syllabus_with_ai(text: str) -> dict:
-    """
-    Parse syllabus text using GPT-4o mini with JSON mode.
-    JSON mode guarantees a valid JSON object back every time —
-    no regex fallback parsing needed.
-    """
     print(f"Starting AI parse, text length: {len(text)}")
     completion = openai_client.chat.completions.create(
         model="gpt-5.4-mini",
@@ -123,6 +131,58 @@ def parse_syllabus_with_ai(text: str) -> dict:
         max_completion_tokens=8000,
     )
     return json.loads(completion.choices[0].message.content)
+
+
+def _times_overlap(start1: str, end1: str, start2: str, end2: str) -> bool:
+    """Check if two HH:MM time ranges overlap."""
+    try:
+        s1 = int(start1.replace(":", ""))
+        e1 = int(end1.replace(":", ""))
+        s2 = int(start2.replace(":", ""))
+        e2 = int(end2.replace(":", ""))
+        return not (e1 <= s2 or e2 <= s1)
+    except Exception:
+        return False
+
+
+def _create_ics(events: list, course_name: str, course_code: str) -> bytes:
+    from icalendar import Calendar, Event as ICalEvent
+    cal = Calendar()
+    cal.add("prodid", "-//Deadlined//deadlined.app//EN")
+    cal.add("version", "2.0")
+    cal.add("calscale", "GREGORIAN")
+
+    for ev in events:
+        ie = ICalEvent()
+        ie.add("uid", str(uuid.uuid4()))
+        ie.add("summary", ev.get("title", "Event"))
+
+        date_str = ev.get("date", "")
+        time_str = ev.get("time", "09:00")
+        end_time_str = ev.get("end_time", "10:00")
+
+        try:
+            start_dt = datetime.strptime(f"{date_str}T{time_str}", "%Y-%m-%dT%H:%M")
+            end_dt   = datetime.strptime(f"{date_str}T{end_time_str}", "%Y-%m-%dT%H:%M")
+            ie.add("dtstart", start_dt)
+            ie.add("dtend", end_dt)
+        except Exception:
+            continue
+
+        desc_parts = []
+        if course_name:
+            desc_parts.append(course_name)
+        if ev.get("description"):
+            desc_parts.append(ev["description"])
+        if desc_parts:
+            ie.add("description", "\n".join(desc_parts))
+
+        ev_type = ev.get("type", "other")
+        ie.add("categories", [ev_type.upper()])
+
+        cal.add_component(ie)
+
+    return cal.to_ical()
 
 
 # ─── App ──────────────────────────────────────────────────────────────────────
@@ -229,18 +289,16 @@ def logout(response: Response):
     return {"ok": True}
 
 
-# ─── Parse endpoint ───────────────────────────────────────────────────────────
+# ─── Parse endpoints ──────────────────────────────────────────────────────────
 
 @app.post("/parse")
 async def parse_syllabus(
     file: UploadFile = File(...),
     user_id: int = Depends(get_current_user_id),
 ):
-    """Extract text from PDF and use GPT-4o mini to return structured events."""
-
-    # 1. Read PDF bytes and extract text
+    """Extract text from PDF and parse with AI."""
     contents = await file.read()
-    text     = ""
+    text = ""
     with pdfplumber.open(io.BytesIO(contents)) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text()
@@ -250,11 +308,29 @@ async def parse_syllabus(
     if not text.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from PDF")
 
-    # 2. Parse with GPT-4o mini
     try:
         parsed = parse_syllabus_with_ai(text)
     except Exception as e:
-        print(f"PARSE ERROR: {type(e).__name__}: {e}")  # add this
+        print(f"PARSE ERROR: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"AI parsing failed: {str(e)}")
+
+    return parsed
+
+
+@app.post("/parse-text")
+async def parse_text(
+    payload: dict,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Parse pasted syllabus text directly — skips PDF extraction."""
+    text = payload.get("text", "")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No text provided")
+
+    try:
+        parsed = parse_syllabus_with_ai(text)
+    except Exception as e:
+        print(f"PARSE ERROR: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"AI parsing failed: {str(e)}")
 
     return parsed
@@ -268,10 +344,6 @@ async def push_to_calendar(
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
-    """
-    Push confirmed events to Google Calendar and save course to DB.
-    payload: { course_name, course_code, semester_start, semester_end, events: [...], omissions: [...] }
-    """
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not user.access_token:
         raise HTTPException(status_code=401, detail="No access token")
@@ -282,17 +354,14 @@ async def push_to_calendar(
     semester_start = payload.get("semester_start")
     semester_end   = payload.get("semester_end")
 
-    # Build course_id
     slug      = re.sub(r"[^a-z0-9]", "", course_code.lower())
     term_slug = "s26"
     course_id = f"user{user_id}_{slug}_{term_slug}"
 
-    # Check for duplicate
     existing = db.query(Course).filter(Course.course_id == course_id).first()
     if existing:
         raise HTTPException(status_code=409, detail="Course already uploaded")
 
-    # Push each event to Google Calendar
     pushed  = 0
     headers = {"Authorization": f"Bearer {user.access_token}", "Content-Type": "application/json"}
 
@@ -313,7 +382,7 @@ async def push_to_calendar(
                     "end":   {"dateTime": end_dt,   "timeZone": "America/Chicago"},
                     "extendedProperties": {
                         "private": {
-                            "app_source": "SyllabusApp",
+                            "app_source": "DeadlinedApp",
                             "course_id":  course_id,
                             "event_type": event.get("type", ""),
                         }
@@ -331,34 +400,39 @@ async def push_to_calendar(
             except Exception:
                 continue
 
-    # Count events by type
     event_counts = {"exam": 0, "homework": 0, "project": 0, "lecture": 0}
     for e in events:
         t = e.get("type", "lecture")
         if t in event_counts:
             event_counts[t] += 1
 
-    # Find next deliverable (non-lecture)
     deliverables = [e for e in events if e.get("type") != "lecture"]
     deliverables.sort(key=lambda e: e.get("date", ""))
-    today      = datetime.utcnow().strftime("%Y-%m-%d")
-    upcoming   = [e for e in deliverables if e.get("date", "") >= today]
+    today    = datetime.utcnow().strftime("%Y-%m-%d")
+    upcoming = [e for e in deliverables if e.get("date", "") >= today]
     next_event = None
     if upcoming:
         n          = upcoming[0]
         next_event = {"title": n["title"], "date": n["date"], "type": n["type"]}
 
-    # Save course to DB
     course = Course(
-        user_id        = user_id,
-        course_id      = course_id,
-        name           = course_name,
-        code           = course_code,
-        term           = "Spring 2026",
-        semester_start = semester_start,
-        semester_end   = semester_end,
-        event_counts   = event_counts,
-        next_event     = next_event,
+        user_id           = user_id,
+        course_id         = course_id,
+        name              = course_name,
+        code              = course_code,
+        term              = "Spring 2026",
+        semester_start    = semester_start,
+        semester_end      = semester_end,
+        event_counts      = event_counts,
+        next_event        = next_event,
+        professor         = payload.get("professor"),
+        professor_email   = payload.get("professor_email"),
+        office_hours      = payload.get("office_hours"),
+        location          = payload.get("location"),
+        description       = payload.get("description"),
+        grading_breakdown = payload.get("grading_breakdown"),
+        required_texts    = payload.get("required_texts"),
+        all_events        = events,
     )
     db.add(course)
     db.commit()
@@ -378,6 +452,180 @@ async def push_to_calendar(
     }
 
 
+# ─── Conflicts endpoint ───────────────────────────────────────────────────────
+
+@app.post("/conflicts")
+async def check_conflicts(
+    payload: dict,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Check new events against Google Calendar and existing DB courses for conflicts."""
+    events         = payload.get("events", [])
+    semester_start = payload.get("semester_start", "")
+    semester_end   = payload.get("semester_end", "")
+
+    if not events:
+        return {"conflicts": []}
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.access_token:
+        return {"conflicts": []}
+
+    # 1. Fetch existing Google Calendar events
+    gcal_events = []
+    if semester_start and semester_end:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{GOOGLE_CALENDAR_URL}/calendars/primary/events",
+                    headers={"Authorization": f"Bearer {user.access_token}"},
+                    params={
+                        "timeMin":       f"{semester_start}T00:00:00Z",
+                        "timeMax":       f"{semester_end}T23:59:59Z",
+                        "singleEvents":  "true",
+                        "maxResults":    500,
+                    },
+                )
+                if resp.status_code == 200:
+                    for item in resp.json().get("items", []):
+                        start_raw = item.get("start", {})
+                        date_str  = (start_raw.get("dateTime") or start_raw.get("date", ""))[:10]
+                        time_str  = "00:00"
+                        end_str   = "23:59"
+                        if "dateTime" in start_raw:
+                            time_str = start_raw["dateTime"][11:16]
+                        if "dateTime" in item.get("end", {}):
+                            end_str = item["end"]["dateTime"][11:16]
+                        gcal_events.append({
+                            "title":    item.get("summary", "Calendar event"),
+                            "date":     date_str,
+                            "time":     time_str,
+                            "end_time": end_str,
+                            "type":     "external",
+                        })
+        except Exception as exc:
+            print(f"GCal fetch error: {exc}")
+
+    # 2. Gather DB course events
+    existing_courses = db.query(Course).filter(Course.user_id == user_id).all()
+    db_events = []
+    for c in existing_courses:
+        for e in (c.all_events or []):
+            db_events.append({**e, "_course_code": c.code})
+
+    all_existing = gcal_events + db_events
+
+    raw_conflicts = []
+
+    # exact_overlap: same date, overlapping times, both non-lecture
+    for new_ev in events:
+        if new_ev.get("type") == "lecture":
+            continue
+        for ex_ev in all_existing:
+            if ex_ev.get("type") in ("lecture",):
+                continue
+            if new_ev.get("date") != ex_ev.get("date"):
+                continue
+            if _times_overlap(
+                new_ev.get("time", "00:00"), new_ev.get("end_time", "23:59"),
+                ex_ev.get("time", "00:00"),  ex_ev.get("end_time", "23:59"),
+            ):
+                raw_conflicts.append({
+                    "event_a":       new_ev,
+                    "event_b":       ex_ev,
+                    "conflict_type": "exact_overlap",
+                    "ai_summary":    "",
+                })
+
+    # same_day_cluster: 3+ non-lecture events on same day
+    day_map: dict[str, list] = defaultdict(list)
+    for e in events:
+        if e.get("type") != "lecture":
+            day_map[e["date"]].append(e)
+    for e in all_existing:
+        if e.get("type") not in ("lecture", "external"):
+            day_map[e.get("date", "")].append(e)
+
+    reported_days: set[str] = set()
+    for day, day_evs in day_map.items():
+        if len(day_evs) >= 3 and day not in reported_days:
+            new_on_day = [e for e in events if e.get("date") == day and e.get("type") != "lecture"]
+            if new_on_day:
+                others = len(day_evs) - 1
+                raw_conflicts.append({
+                    "event_a": new_on_day[0],
+                    "event_b": {
+                        "title": f"{others} other deadline{'s' if others != 1 else ''} on this day",
+                        "date":  day,
+                        "type":  "cluster",
+                    },
+                    "conflict_type": "same_day_cluster",
+                    "ai_summary":    "",
+                })
+                reported_days.add(day)
+
+    if not raw_conflicts:
+        return {"conflicts": []}
+
+    # Generate AI summaries in one batch call
+    try:
+        conflict_lines = "\n".join(
+            f"{i+1}. '{c['event_a']['title']}' on {c['event_a']['date']} vs "
+            f"'{c['event_b']['title']}' ({c['conflict_type'].replace('_', ' ')})"
+            for i, c in enumerate(raw_conflicts)
+        )
+        completion = openai_client.chat.completions.create(
+            model="gpt-5.4-mini",
+            messages=[{
+                "role": "user",
+                "content": (
+                    "For each calendar conflict write one plain English sentence "
+                    "(e.g. 'Your CS 300 exam overlaps with a Biology lab already on your calendar'). "
+                    f'Return JSON: {{"summaries": ["sentence 1", ...]}}\n\nConflicts:\n{conflict_lines}'
+                ),
+            }],
+            response_format={"type": "json_object"},
+            max_completion_tokens=600,
+        )
+        summaries = json.loads(completion.choices[0].message.content).get("summaries", [])
+        for i, c in enumerate(raw_conflicts):
+            if i < len(summaries):
+                c["ai_summary"] = summaries[i]
+    except Exception as exc:
+        print(f"Conflict summary error: {exc}")
+        for c in raw_conflicts:
+            if not c["ai_summary"]:
+                c["ai_summary"] = (
+                    f"{c['event_a']['title']} conflicts with "
+                    f"{c['event_b']['title']} on {c['event_a']['date']}"
+                )
+
+    return {"conflicts": raw_conflicts}
+
+
+# ─── ICS export ───────────────────────────────────────────────────────────────
+
+@app.post("/export/ics")
+async def export_ics(
+    payload: dict,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Return a .ics calendar file for the given events."""
+    events      = payload.get("events", [])
+    course_name = payload.get("course_name", "")
+    course_code = payload.get("course_code", "")
+
+    ics_bytes = _create_ics(events, course_name, course_code)
+    filename  = re.sub(r"[^a-z0-9]", "_", course_code.lower()) or "deadlined"
+
+    return Response(
+        content=ics_bytes,
+        media_type="text/calendar",
+        headers={"Content-Disposition": f'attachment; filename="{filename}.ics"'},
+    )
+
+
 # ─── Courses ──────────────────────────────────────────────────────────────────
 
 @app.get("/courses")
@@ -385,15 +633,23 @@ def get_courses(user_id: int = Depends(get_current_user_id), db: Session = Depen
     courses = db.query(Course).filter(Course.user_id == user_id).all()
     return [
         {
-            "id":             c.course_id,
-            "name":           c.name,
-            "code":           c.code,
-            "term":           c.term,
-            "semester_start": c.semester_start,
-            "semester_end":   c.semester_end,
-            "events":         c.event_counts or {},
-            "nextEvent":      c.next_event,
-            "uploadedAt":     c.uploaded_at.strftime("%b %d, %Y") if c.uploaded_at else "",
+            "id":               c.course_id,
+            "name":             c.name,
+            "code":             c.code,
+            "term":             c.term,
+            "semesterStart":    c.semester_start,
+            "semesterEnd":      c.semester_end,
+            "events":           c.event_counts or {},
+            "nextEvent":        c.next_event,
+            "uploadedAt":       c.uploaded_at.strftime("%b %d, %Y") if c.uploaded_at else "",
+            "professor":        c.professor,
+            "professorEmail":   c.professor_email,
+            "officeHours":      c.office_hours,
+            "location":         c.location,
+            "description":      c.description,
+            "gradingBreakdown": c.grading_breakdown,
+            "requiredTexts":    c.required_texts,
+            "allEvents":        c.all_events or [],
         }
         for c in courses
     ]
